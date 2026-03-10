@@ -1,4 +1,3 @@
-import { Tensor } from '@xenova/transformers';
 import { getModel, getTokenizer } from './phiLoader';
 
 export interface GenerationOptions {
@@ -32,11 +31,10 @@ export async function generateResponse(
   // Tokenize input - returns { input_ids: number[] }
   const inputs = tokenizer(prompt);
   
-  // Create tensor from input IDs [batch, seq_len]
-  const inputIds = new Tensor('int64', inputs.input_ids, [1, inputs.input_ids.length]);
-
-  // Generate - returns Tensor of token IDs
-  const output = await model.generate(inputIds, {
+  // Generate - HuggingFace Transformers.js
+  // Use type assertion to handle the API differences
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const output = await (model as any).generate(inputs.input_ids, {
     max_new_tokens: opts.max_new_tokens,
     temperature: opts.temperature,
     top_p: opts.top_p,
@@ -44,15 +42,10 @@ export async function generateResponse(
     pad_token_id: tokenizer.pad_token_id || 1,
   });
 
-  // Decode output - output is a Tensor, extract data
-  const generatedTokens = output.data;
-  const response = tokenizer.batch_decode(
-    typeof generatedTokens === 'number' 
-      ? [[generatedTokens]] 
-      : Array.isArray(generatedTokens) 
-        ? [generatedTokens] 
-        : (generatedTokens as number[][])
-  )[0];
+  // Decode output - output is an array of token IDs
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const generatedTokens = Array.isArray(output) ? output : [output];
+  const response = tokenizer.batch_decode(generatedTokens)[0];
 
   // Extract just the response part (after the prompt)
   let responseText = response;

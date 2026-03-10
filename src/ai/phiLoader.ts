@@ -1,4 +1,4 @@
-import { AutoTokenizer, AutoModelForCausalLM, env } from '@xenova/transformers';
+import { AutoTokenizer, AutoModelForCausalLM, env } from '@huggingface/transformers';
 
 // Simple WebGPU check - use any to avoid TypeScript DOM.WebGPU issues
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -29,6 +29,7 @@ export interface PhiLoaderState {
 
 type StateListener = (state: PhiLoaderState) => void;
 
+// Use the Phi-3.5 Mini Instruct model with proper ONNX WebGPU configuration
 const MODEL_ID = 'onnx-community/Phi-3.5-mini-instruct-onnx-web';
 
 let tokenizer: Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>> | null = null;
@@ -98,7 +99,6 @@ async function _loadPhi(): Promise<void> {
   notifyListeners();
 
   // Check WebGPU availability
-  const nav = navigator as { gpu?: unknown };
   if (!hasWebGPU()) {
     state.stage = 'error';
     state.error = 'WebGPU not available on this device';
@@ -107,26 +107,13 @@ async function _loadPhi(): Promise<void> {
     return;
   }
 
-  // Call requestAdapter directly on navigator.gpu to avoid illegal invocation
-  const gpu = nav.gpu as { requestAdapter: () => Promise<unknown> };
-  const adapter = await gpu.requestAdapter();
-  if (!adapter) {
-    state.stage = 'error';
-    state.error = 'WebGPU not available on this device';
-    console.error('[phiLoader] Could not get GPU adapter');
-    notifyListeners();
-    return;
-  }
-
-  console.log('[phiLoader] WebGPU available, adapter acquired');
+  console.log('[phiLoader] WebGPU available');
 
   // Configure Transformers.js for WebGPU
-  // Use browser cache and disable local models
-  env.allowLocalModels = false;
+  // Use browser cache
   env.useBrowserCache = true;
+  env.allowLocalModels = false;
   
-  // Transformers.js auto-detects WebGPU when available, no manual injection needed
-
   // Get storage before loading
   state.storageBefore = await getStorageEstimate();
   console.log('[phiLoader] Storage before load:', state.storageBefore);
@@ -138,11 +125,8 @@ async function _loadPhi(): Promise<void> {
   notifyListeners();
 
   try {
-    tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, {
-      progress_callback: (progress: number) => {
-        console.log('[phiLoader] Tokenizer download:', Math.round(progress * 100) + '%');
-      },
-    });
+    // Load tokenizer
+    tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
     console.log('[phiLoader] Tokenizer loaded');
   } catch (err) {
     state.stage = 'error';
@@ -158,13 +142,13 @@ async function _loadPhi(): Promise<void> {
   notifyListeners();
 
   try {
-    // Load model with q4f16 quantization
-    // The model ID already specifies the quantized webgpu version
+    // Load model with WebGPU device and q4f16 dtype
+    // The onnx-community model is pre-quantized for WebGPU
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     model = await AutoModelForCausalLM.from_pretrained(MODEL_ID, {
-      progress_callback: (progress: number) => {
-        console.log('[phiLoader] Model download:', Math.round(progress * 100) + '%');
-      },
-    });
+      device: 'webgpu',
+      dtype: 'q4f16',
+    }) as any;
     console.log('[phiLoader] Model loaded on WebGPU');
   } catch (err) {
     state.stage = 'error';
