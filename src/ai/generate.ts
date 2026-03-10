@@ -29,24 +29,30 @@ export async function generateResponse(
 
   console.log('[generate] Generating response for prompt:', prompt.substring(0, 50) + '...');
 
-  // Tokenize input
+  // Tokenize input - returns { input_ids: number[] }
   const inputs = tokenizer(prompt);
   
-  // Create tensor from input IDs
+  // Create tensor from input IDs [batch, seq_len]
   const inputIds = new Tensor('int64', inputs.input_ids, [1, inputs.input_ids.length]);
 
-  // Generate
-  const outputs = await model.generate(inputIds, {
+  // Generate - returns Tensor of token IDs
+  const output = await model.generate(inputIds, {
     max_new_tokens: opts.max_new_tokens,
     temperature: opts.temperature,
     top_p: opts.top_p,
     do_sample: true,
-    pad_token_id: tokenizer.pad_token_id || 1, // Default to 1 (usually eos/pad)
+    pad_token_id: tokenizer.pad_token_id || 1,
   });
 
-  // Decode output
-  const generatedTokens = outputs[0];
-  const response = tokenizer.batch_decode(generatedTokens)[0];
+  // Decode output - output is a Tensor, extract data
+  const generatedTokens = output.data;
+  const response = tokenizer.batch_decode(
+    typeof generatedTokens === 'number' 
+      ? [[generatedTokens]] 
+      : Array.isArray(generatedTokens) 
+        ? [generatedTokens] 
+        : (generatedTokens as number[][])
+  )[0];
 
   // Extract just the response part (after the prompt)
   let responseText = response;

@@ -1,5 +1,12 @@
 import { AutoTokenizer, AutoModelForCausalLM, env } from '@xenova/transformers';
 
+// Simple WebGPU check - use any to avoid TypeScript DOM.WebGPU issues
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function hasWebGPU(): boolean {
+  const gpu = (navigator as any).gpu;
+  return !!gpu && typeof gpu.requestAdapter === 'function';
+}
+
 export type LoadingStage = 
   | 'idle'
   | 'checking-webgpu'
@@ -8,17 +15,19 @@ export type LoadingStage =
   | 'ready'
   | 'error';
 
-interface StorageInfo {
+export interface StorageInfo {
   usage: number;
   quota: number;
 }
 
-interface PhiLoaderState {
+export interface PhiLoaderState {
   stage: LoadingStage;
   error: string | null;
   storageBefore: StorageInfo | null;
   storageAfter: StorageInfo | null;
 }
+
+type StateListener = (state: PhiLoaderState) => void;
 
 const MODEL_ID = 'onnx-community/Phi-3.5-mini-instruct-onnx-web';
 
@@ -31,6 +40,12 @@ let state: PhiLoaderState = {
   storageAfter: null,
 };
 let loadingPromise: Promise<void> | null = null;
+const listeners: Set<StateListener> = new Set();
+
+function notifyListeners(): void {
+  const snapshot = getStatus();
+  listeners.forEach(listener => listener(snapshot));
+}
 
 async function getStorageEstimate(): Promise<StorageInfo> {
   try {
@@ -46,6 +61,14 @@ async function getStorageEstimate(): Promise<StorageInfo> {
 
 export function getStatus(): PhiLoaderState {
   return { ...state };
+}
+
+export function subscribe(listener: StateListener): () => void {
+  listeners.add(listener);
+  // Immediately call with current state
+  listener(getStatus());
+  // Return unsubscribe function
+  return () => listeners.delete(listener);
 }
 
 export async function loadPhi(): Promise<void> {
@@ -72,30 +95,26 @@ async function _loadPhi(): Promise<void> {
   state.stage = 'checking-webgpu';
   state.error = null;
   console.log('[phiLoader] Stage: checking-webgpu');
+  notifyListeners();
 
-  // Check WebGPU availability with proper typing
-  const nav = navigator as unknown as { gpu?: { requestAdapter?: () => Promise<unknown> } };
-  const gpu = nav.gpu;
-  if (!gpu) {
+  // Check WebGPU availability
+  const nav = navigator as { gpu?: unknown };
+  if (!hasWebGPU()) {
     state.stage = 'error';
     state.error = 'WebGPU not available on this device';
     console.error('[phiLoader] WebGPU not available');
+    notifyListeners();
     return;
   }
 
-  const requestAdapter = gpu.requestAdapter;
-  if (!requestAdapter) {
-    state.stage = 'error';
-    state.error = 'WebGPU not available on this device';
-    console.error('[phiLoader] Could not get GPU adapter');
-    return;
-  }
-
-  const adapter = await requestAdapter();
+  // Call requestAdapter directly on navigator.gpu to avoid illegal invocation
+  const gpu = nav.gpu as { requestAdapter: () => Promise<unknown> };
+  const adapter = await gpu.requestAdapter();
   if (!adapter) {
     state.stage = 'error';
     state.error = 'WebGPU not available on this device';
     console.error('[phiLoader] Could not get GPU adapter');
+    notifyListeners();
     return;
   }
 
@@ -106,17 +125,17 @@ async function _loadPhi(): Promise<void> {
   env.allowLocalModels = false;
   env.useBrowserCache = true;
   
-  // Set device for model loading using any to avoid complex typing
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (env.backends as any).onnx?.webgpu?.device?.set?.(adapter);
+  // Transformers.js auto-detects WebGPU when available, no manual injection needed
 
   // Get storage before loading
   state.storageBefore = await getStorageEstimate();
   console.log('[phiLoader] Storage before load:', state.storageBefore);
+  notifyListeners();
 
   // Stage: loading-tokenizer
   state.stage = 'loading-tokenizer';
   console.log('[phiLoader] Stage: loading-tokenizer');
+  notifyListeners();
 
   try {
     tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, {
@@ -129,12 +148,14 @@ async function _loadPhi(): Promise<void> {
     state.stage = 'error';
     state.error = `Failed to load tokenizer: ${err}`;
     console.error('[phiLoader] Tokenizer error:', err);
+    notifyListeners();
     return;
   }
 
   // Stage: loading-model
   state.stage = 'loading-model';
   console.log('[phiLoader] Stage: loading-model');
+  notifyListeners();
 
   try {
     // Load model with q4f16 quantization
@@ -149,6 +170,7 @@ async function _loadPhi(): Promise<void> {
     state.stage = 'error';
     state.error = `Failed to load model: ${err}`;
     console.error('[phiLoader] Model error:', err);
+    notifyListeners();
     return;
   }
 
@@ -159,6 +181,7 @@ async function _loadPhi(): Promise<void> {
   // Stage: ready
   state.stage = 'ready';
   console.log('[phiLoader] Stage: ready');
+  notifyListeners();
 }
 
 export function getModel() {

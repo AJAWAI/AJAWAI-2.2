@@ -4,9 +4,18 @@ interface ChatProps {
   onSendMessage: (message: string) => void;
   isModelLoaded: boolean;
   isGenerating: boolean;
+  colors: {
+    background: string;
+    panel: string;
+    primaryText: string;
+    accent: string;
+    white: string;
+    border: string;
+    muted: string;
+  };
 }
 
-export function Chat({ onSendMessage, isModelLoaded, isGenerating }: ChatProps) {
+export function Chat({ onSendMessage, isModelLoaded, isGenerating, colors }: ChatProps) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
   const [streamingContent, setStreamingContent] = useState('');
@@ -28,14 +37,10 @@ export function Chat({ onSendMessage, isModelLoaded, isGenerating }: ChatProps) 
     onSendMessage(userMessage);
   };
 
-  const handleStreamChunk = (chunk: string) => {
-    setStreamingContent((prev) => prev + chunk);
-  };
-
   // Expose stream handler via custom event
   useEffect(() => {
     const handleStream = (e: CustomEvent<string>) => {
-      handleStreamChunk(e.detail);
+      setStreamingContent((prev) => prev + e.detail);
     };
     window.addEventListener('ajawai-stream' as keyof WindowEventMap, handleStream as EventListener);
     return () => {
@@ -51,18 +56,34 @@ export function Chat({ onSendMessage, isModelLoaded, isGenerating }: ChatProps) 
     }
   }, [isGenerating]);
 
+  const canSend = isModelLoaded && !isGenerating && input.trim();
+
   return (
-    <div style={styles.container}>
-      <div style={styles.messages}>
+    <div style={{ ...styles.container, background: colors.white, borderColor: colors.border }}>
+      <div style={{ ...styles.messages, background: colors.white }}>
+        {messages.length === 0 && !streamingContent && (
+          <div style={{ ...styles.emptyState, color: colors.muted }}>
+            {!isModelLoaded 
+              ? 'Waiting for model to load...' 
+              : 'Say hi to Phi!'}
+          </div>
+        )}
         {messages.map((msg, idx) => (
-          <div key={idx} style={msg.role === 'user' ? styles.userMessage : styles.assistantMessage}>
-            <div style={styles.messageLabel}>{msg.role === 'user' ? 'You' : 'Phi'}</div>
+          <div 
+            key={idx} 
+            style={msg.role === 'user' 
+              ? { ...styles.userMessage, background: colors.accent, color: colors.white } 
+              : { ...styles.assistantMessage, background: colors.panel, color: colors.primaryText }}
+          >
+            <div style={{ ...styles.messageLabel, color: msg.role === 'user' ? 'rgba(255,255,255,0.7)' : colors.muted }}>
+              {msg.role === 'user' ? 'You' : 'Phi'}
+            </div>
             <div style={styles.messageContent}>{msg.content}</div>
           </div>
         ))}
         {streamingContent && (
-          <div style={styles.assistantMessage}>
-            <div style={styles.messageLabel}>Phi</div>
+          <div style={{ ...styles.assistantMessage, background: colors.panel, color: colors.primaryText }}>
+            <div style={{ ...styles.messageLabel, color: colors.muted }}>Phi</div>
             <div style={styles.messageContent}>
               {streamingContent}
               <span style={styles.cursor}>▊</span>
@@ -72,19 +93,28 @@ export function Chat({ onSendMessage, isModelLoaded, isGenerating }: ChatProps) 
         <div ref={messagesEndRef} />
       </div>
 
-      <form onSubmit={handleSubmit} style={styles.inputArea}>
+      <form onSubmit={handleSubmit} style={{ ...styles.inputArea, background: colors.panel, borderColor: colors.border }}>
         <input
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder={isModelLoaded ? 'Type a message...' : 'Loading model...'}
           disabled={!isModelLoaded || isGenerating}
-          style={styles.input}
+          style={{ 
+            ...styles.input, 
+            background: colors.white, 
+            borderColor: colors.border,
+            color: colors.primaryText 
+          }}
         />
         <button
           type="submit"
-          disabled={!isModelLoaded || isGenerating || !input.trim()}
-          style={styles.sendButton}
+          disabled={!canSend}
+          style={{ 
+            ...styles.sendButton, 
+            background: canSend ? colors.accent : colors.muted,
+            cursor: canSend ? 'pointer' : 'not-allowed'
+          }}
         >
           {isGenerating ? '...' : 'Send'}
         </button>
@@ -98,7 +128,10 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     height: 'calc(100vh - 180px)',
-    minHeight: '300px',
+    minHeight: '400px',
+    borderRadius: '16px',
+    border: '1px solid',
+    overflow: 'hidden',
   },
   messages: {
     flex: 1,
@@ -108,26 +141,29 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     gap: '12px',
   },
+  emptyState: {
+    textAlign: 'center',
+    padding: '40px 20px',
+    fontSize: '14px',
+  },
   userMessage: {
     alignSelf: 'flex-end',
-    background: '#2d2d2d',
     padding: '12px 16px',
-    borderRadius: '12px 12px 4px 12px',
+    borderRadius: '16px 16px 4px 16px',
     maxWidth: '80%',
   },
   assistantMessage: {
     alignSelf: 'flex-start',
-    background: '#1a1a2e',
     padding: '12px 16px',
-    borderRadius: '12px 12px 12px 4px',
+    borderRadius: '16px 16px 16px 4px',
     maxWidth: '80%',
   },
   messageLabel: {
     fontSize: '11px',
-    color: '#888',
     marginBottom: '4px',
     textTransform: 'uppercase',
     letterSpacing: '0.5px',
+    fontWeight: '600',
   },
   messageContent: {
     fontSize: '14px',
@@ -143,29 +179,23 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     gap: '8px',
     padding: '16px',
-    borderTop: '1px solid #333',
-    background: '#0f0f0f',
+    borderTop: '1px solid',
   },
   input: {
     flex: 1,
     padding: '12px 16px',
     fontSize: '14px',
-    borderRadius: '8px',
-    border: '1px solid #333',
-    background: '#1a1a1a',
-    color: '#e0e0e0',
+    borderRadius: '12px',
+    border: '1px solid',
     outline: 'none',
   },
   sendButton: {
     padding: '12px 24px',
     fontSize: '14px',
     fontWeight: '600',
-    borderRadius: '8px',
+    borderRadius: '12px',
     border: 'none',
-    background: '#4a9eff',
     color: '#fff',
-    cursor: 'pointer',
-    opacity: 1,
     transition: 'opacity 0.2s',
   },
 };
