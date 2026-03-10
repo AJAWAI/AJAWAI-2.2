@@ -1,4 +1,4 @@
-import { getModel, getTokenizer } from './phiLoader';
+import { getModel, getTokenizer, markGenerateReached } from './phiLoader';
 
 export interface GenerationOptions {
   max_new_tokens?: number;
@@ -27,6 +27,9 @@ export async function generateResponse(
   const opts = { ...DEFAULT_OPTIONS, ...options };
 
   console.log('[generate] Generating response for prompt:', prompt.substring(0, 50) + '...');
+
+  // Mark that we've reached the generate path
+  markGenerateReached();
 
   // Tokenize input - returns { input_ids: number[] }
   const inputs = tokenizer(prompt);

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Chat } from './ui/Chat';
 import { DebugPanel } from './ui/DebugPanel';
-import { loadPhi, subscribe, LoadingStage, PhiLoaderState } from './ai/phiLoader';
+import { loadPhi, subscribe, LoadingStage, LoaderDiagnostics } from './ai/phiLoader';
 import { generateResponse } from './ai/generate';
 
 // Mint/pale green theme palette
@@ -34,7 +34,7 @@ export function App() {
 
   // Subscribe to loader state updates for live progress
   useEffect(() => {
-    const unsubscribe = subscribe((loaderState: PhiLoaderState) => {
+    const unsubscribe = subscribe((loaderState: LoaderDiagnostics) => {
       setState((prev) => ({
         ...prev,
         loadingStage: loaderState.stage,
@@ -133,9 +133,6 @@ export function App() {
 
         {showDebug && (
           <DebugPanel
-            loadingStage={loadingStage}
-            modelLoaded={modelLoaded}
-            error={error}
             colors={colors}
           />
         )}
