@@ -62,13 +62,27 @@ export function DebugPanel({ colors }: DebugPanelProps) {
     if (diagnostics.stage === 'error') return '#D32F2F';
     if (diagnostics.stage === 'ready') return colors.accent;
     if (diagnostics.abandonedLoad) return '#9E9E9E';
+    if (diagnostics.crashRiskLevel === 'critical') return '#D32F2F';
+    if (diagnostics.crashRiskLevel === 'high') return '#F57C00';
     return '#1976D2';
   };
 
   const getStatusText = (): string => {
     if (diagnostics.abandonedLoad) return 'ABANDONED';
     if (diagnostics.stage === 'timeout') return 'TIMEOUT';
+    if (diagnostics.crashRiskLevel === 'critical') return 'CRITICAL';
+    if (diagnostics.crashRiskLevel === 'high') return 'HIGH RISK';
     return diagnostics.stage.toUpperCase();
+  };
+
+  const getRiskColor = (): string => {
+    switch (diagnostics.crashRiskLevel) {
+      case 'critical': return '#D32F2F';
+      case 'high': return '#F57C00';
+      case 'medium': return '#FFC107';
+      case 'low': return '#4CAF50';
+      default: return colors.muted;
+    }
   };
 
   return (
@@ -78,7 +92,7 @@ export function DebugPanel({ colors }: DebugPanelProps) {
       borderColor: colors.border 
     }}>
       <div style={{ ...styles.header, borderColor: colors.border }}>
-        <span style={{ ...styles.title, color: colors.primaryText }}>Deep Diagnostics</span>
+        <span style={{ ...styles.title, color: colors.primaryText }}>Crash/Risk Diagnostics</span>
         <span style={{ 
           ...styles.statusBadge, 
           background: getStatusColor(),
@@ -89,6 +103,57 @@ export function DebugPanel({ colors }: DebugPanelProps) {
       </div>
 
       <div style={styles.content}>
+        {/* Crash Risk Warning */}
+        {diagnostics.crashRiskLevel !== 'none' && (
+          <div style={{ 
+            ...styles.riskWarning,
+            borderColor: getRiskColor(),
+            background: diagnostics.crashRiskLevel === 'critical' ? '#FFEBEE' : '#FFF8E1',
+          }}>
+            <div style={{ 
+              ...styles.riskTitle, 
+              color: getRiskColor() 
+            }}>
+              ⚠️ CRASH RISK: {diagnostics.crashRiskLevel.toUpperCase()}
+            </div>
+            <div style={styles.riskMessage}>
+              {diagnostics.crashRiskMessage || 'Monitoring for crash risk...'}
+            </div>
+          </div>
+        )}
+
+        {/* Size Analysis */}
+        <div style={styles.section}>
+          <div style={styles.sectionTitle}>Size Analysis</div>
+          <div style={styles.sizeGrid}>
+            <div style={styles.sizeItem}>
+              <span style={{ ...styles.sizeLabel, color: colors.muted }}>Declared Size</span>
+              <span style={{ ...styles.sizeValue, color: colors.primaryText }}>
+                ~{diagnostics.declaredModelSizeMB} MB
+              </span>
+            </div>
+            <div style={styles.sizeItem}>
+              <span style={{ ...styles.sizeLabel, color: colors.muted }}>Observed Transfer</span>
+              <span style={{ 
+                ...styles.sizeValue, 
+                color: diagnostics.observedTotalMB > 500 ? '#F57C00' : colors.primaryText,
+                fontWeight: diagnostics.observedTotalMB > 500 ? 'bold' : 'normal',
+              }}>
+                {diagnostics.observedTotalMB > 0 
+                  ? `~${diagnostics.observedTotalMB.toFixed(0)} MB`
+                  : 'Calculating...'}
+              </span>
+            </div>
+            {diagnostics.observedTotalMB > 0 && (
+              <div style={{ ...styles.sizeItem, gridColumn: '1 / -1' }}>
+                <span style={{ color: '#D32F2F', fontSize: '11px' }}>
+                  ⚠️ Transfer is {Math.round(diagnostics.observedTotalMB / diagnostics.declaredModelSizeMB)}x larger than declared!
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* State Flags */}
         <div style={styles.section}>
           <div style={styles.sectionTitle}>State Flags</div>
@@ -114,6 +179,11 @@ export function DebugPanel({ colors }: DebugPanelProps) {
             <span style={{ color: colors.muted }}>Generate Reached:</span>
             <span style={{ color: diagnostics.generateReached ? colors.accent : colors.muted }}>
               {diagnostics.generateReached ? 'YES' : 'No'}
+            </span>
+            
+            <span style={{ color: colors.muted }}>Crash Risk:</span>
+            <span style={{ color: getRiskColor(), fontWeight: 'bold' }}>
+              {diagnostics.crashRiskLevel.toUpperCase()}
             </span>
           </div>
         </div>
@@ -141,7 +211,9 @@ export function DebugPanel({ colors }: DebugPanelProps) {
             </div>
             <div style={styles.progressRow}>
               <span style={{ color: colors.muted }}>Model:</span>
-              <span style={{ color: colors.primaryText }}>
+              <span style={{ 
+                color: diagnostics.modelDownloadProgress >= 95 ? '#F57C00' : colors.primaryText 
+              }}>
                 {diagnostics.modelDownloadProgress}%
               </span>
             </div>
@@ -160,7 +232,10 @@ export function DebugPanel({ colors }: DebugPanelProps) {
             </div>
             <div style={styles.infoItem}>
               <span style={{ ...styles.infoLabel, color: colors.muted }}>Substage</span>
-              <span style={{ ...styles.infoValue, color: colors.accent }}>
+              <span style={{ 
+                ...styles.infoValue, 
+                color: diagnostics.modelPhaseStuckAtHighProgress ? '#F57C00' : colors.accent 
+              }}>
                 {diagnostics.substage}
               </span>
             </div>
@@ -173,7 +248,9 @@ export function DebugPanel({ colors }: DebugPanelProps) {
             <div style={styles.infoItem}>
               <span style={{ ...styles.infoLabel, color: colors.muted }}>Model Size</span>
               <span style={{ ...styles.infoValue, color: colors.primaryText }}>
-                {diagnostics.estimatedModelSizeMB ? `~${diagnostics.estimatedModelSizeMB} MB` : 'Unknown'}
+                {diagnostics.observedTotalMB > 0 
+                  ? `~${diagnostics.observedTotalMB.toFixed(0)} MB`
+                  : `~${diagnostics.declaredModelSizeMB} MB`}
               </span>
             </div>
           </div>
@@ -200,12 +277,21 @@ export function DebugPanel({ colors }: DebugPanelProps) {
                 {diagnostics.modelPhaseHasProgress ? 'Yes' : 'No'}
               </span>
             </div>
+            <div style={styles.infoItem}>
+              <span style={{ ...styles.infoLabel, color: colors.muted }}>Stuck &gt;95%</span>
+              <span style={{ 
+                ...styles.infoValue, 
+                color: diagnostics.modelPhaseStuckAtHighProgress ? '#D32F2F' : colors.accent 
+              }}>
+                {diagnostics.modelPhaseStuckAtHighProgress ? 'YES - CRASH RISK' : 'No'}
+              </span>
+            </div>
           </div>
           {diagnostics.modelPhaseLastEvent && (
             <div style={styles.lastEvent}>
               <span style={{ color: colors.muted }}>Last Event:</span>
               <code style={{ color: colors.primaryText, fontSize: '10px' }}>
-                {diagnostics.modelPhaseLastEvent.substring(0, 100)}
+                {diagnostics.modelPhaseLastEvent.substring(0, 120)}
               </code>
             </div>
           )}
@@ -244,7 +330,7 @@ export function DebugPanel({ colors }: DebugPanelProps) {
               }}>
                 {diagnostics.storageAfter 
                   ? `${formatBytes(diagnostics.storageAfter.usage)} / ${formatBytes(diagnostics.storageAfter.quota)}`
-                  : 'Not available (load incomplete)'}
+                  : 'Not available (browser may have crashed)'}
               </span>
             </div>
           </div>
@@ -360,8 +446,23 @@ const styles: Record<string, React.CSSProperties> = {
   },
   content: {
     padding: '16px',
-    maxHeight: '600px',
+    maxHeight: '700px',
     overflowY: 'auto',
+  },
+  riskWarning: {
+    border: '2px solid',
+    borderRadius: '8px',
+    padding: '12px',
+    marginBottom: '16px',
+  },
+  riskTitle: {
+    fontSize: '13px',
+    fontWeight: 'bold',
+    marginBottom: '4px',
+  },
+  riskMessage: {
+    fontSize: '11px',
+    color: '#333',
   },
   section: {
     marginBottom: '16px',
@@ -372,6 +473,24 @@ const styles: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase',
     letterSpacing: '0.5px',
     marginBottom: '8px',
+  },
+  sizeGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, 1fr)',
+    gap: '8px',
+  },
+  sizeItem: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+  },
+  sizeLabel: {
+    fontSize: '10px',
+    textTransform: 'uppercase',
+  },
+  sizeValue: {
+    fontSize: '14px',
+    fontFamily: 'monospace',
   },
   flagsGrid: {
     display: 'grid',
@@ -473,7 +592,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '12px',
     borderRadius: '8px',
     overflow: 'auto',
-    maxHeight: '250px',
+    maxHeight: '300px',
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-all',
     margin: 0,
