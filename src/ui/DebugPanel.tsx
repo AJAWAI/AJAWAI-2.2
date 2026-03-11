@@ -58,15 +58,16 @@ export function DebugPanel({ colors }: DebugPanelProps) {
   if (!diagnostics) return null;
 
   const getStatusColor = (): string => {
-    if (diagnostics.stage === 'error' || diagnostics.stage === 'timeout') return '#D32F2F';
+    if (diagnostics.stage === 'timeout') return '#F57C00';
+    if (diagnostics.stage === 'error') return '#D32F2F';
     if (diagnostics.stage === 'ready') return colors.accent;
-    if (diagnostics.isStalled) return '#F57C00';
+    if (diagnostics.abandonedLoad) return '#9E9E9E';
     return '#1976D2';
   };
 
   const getStatusText = (): string => {
+    if (diagnostics.abandonedLoad) return 'ABANDONED';
     if (diagnostics.stage === 'timeout') return 'TIMEOUT';
-    if (diagnostics.isStalled) return 'STALLED';
     return diagnostics.stage.toUpperCase();
   };
 
@@ -77,7 +78,7 @@ export function DebugPanel({ colors }: DebugPanelProps) {
       borderColor: colors.border 
     }}>
       <div style={{ ...styles.header, borderColor: colors.border }}>
-        <span style={{ ...styles.title, color: colors.primaryText }}>Diagnostics</span>
+        <span style={{ ...styles.title, color: colors.primaryText }}>Deep Diagnostics</span>
         <span style={{ 
           ...styles.statusBadge, 
           background: getStatusColor(),
@@ -88,6 +89,35 @@ export function DebugPanel({ colors }: DebugPanelProps) {
       </div>
 
       <div style={styles.content}>
+        {/* State Flags */}
+        <div style={styles.section}>
+          <div style={styles.sectionTitle}>State Flags</div>
+          <div style={styles.flagsGrid}>
+            <span style={{ color: colors.muted }}>Load Gen:</span>
+            <span style={{ color: colors.primaryText }}>#{diagnostics.loadGeneration}</span>
+            
+            <span style={{ color: colors.muted }}>Timed Out:</span>
+            <span style={{ color: diagnostics.timedOut ? '#F57C00' : colors.accent }}>
+              {diagnostics.timedOut ? 'YES' : 'No'}
+            </span>
+            
+            <span style={{ color: colors.muted }}>Abandoned:</span>
+            <span style={{ color: diagnostics.abandonedLoad ? '#D32F2F' : colors.accent }}>
+              {diagnostics.abandonedLoad ? 'YES' : 'No'}
+            </span>
+            
+            <span style={{ color: colors.muted }}>Late Complete:</span>
+            <span style={{ color: diagnostics.completedAfterTimeout ? '#F57C00' : colors.accent }}>
+              {diagnostics.completedAfterTimeout ? 'YES' : 'No'}
+            </span>
+            
+            <span style={{ color: colors.muted }}>Generate Reached:</span>
+            <span style={{ color: diagnostics.generateReached ? colors.accent : colors.muted }}>
+              {diagnostics.generateReached ? 'YES' : 'No'}
+            </span>
+          </div>
+        </div>
+
         {/* Progress Section */}
         <div style={styles.section}>
           <div style={styles.sectionTitle}>Progress</div>
@@ -130,7 +160,7 @@ export function DebugPanel({ colors }: DebugPanelProps) {
             </div>
             <div style={styles.infoItem}>
               <span style={{ ...styles.infoLabel, color: colors.muted }}>Substage</span>
-              <span style={{ ...styles.infoValue, color: colors.primaryText }}>
+              <span style={{ ...styles.infoValue, color: colors.accent }}>
                 {diagnostics.substage}
               </span>
             </div>
@@ -149,6 +179,51 @@ export function DebugPanel({ colors }: DebugPanelProps) {
           </div>
         </div>
 
+        {/* Model Phase Tracking */}
+        <div style={styles.section}>
+          <div style={styles.sectionTitle}>Model Phase</div>
+          <div style={styles.infoGrid}>
+            <div style={styles.infoItem}>
+              <span style={{ ...styles.infoLabel, color: colors.muted }}>Started At</span>
+              <span style={{ ...styles.infoValue, color: colors.primaryText }}>
+                {diagnostics.modelPhaseStartedAt 
+                  ? formatDuration(Date.now() - diagnostics.modelPhaseStartedAt) + ' ago'
+                  : 'N/A'}
+              </span>
+            </div>
+            <div style={styles.infoItem}>
+              <span style={{ ...styles.infoLabel, color: colors.muted }}>Has Progress</span>
+              <span style={{ 
+                ...styles.infoValue, 
+                color: diagnostics.modelPhaseHasProgress ? colors.accent : '#F57C00' 
+              }}>
+                {diagnostics.modelPhaseHasProgress ? 'Yes' : 'No'}
+              </span>
+            </div>
+          </div>
+          {diagnostics.modelPhaseLastEvent && (
+            <div style={styles.lastEvent}>
+              <span style={{ color: colors.muted }}>Last Event:</span>
+              <code style={{ color: colors.primaryText, fontSize: '10px' }}>
+                {diagnostics.modelPhaseLastEvent.substring(0, 100)}
+              </code>
+            </div>
+          )}
+        </div>
+
+        {/* Last Progress Event */}
+        {diagnostics.lastProgressPayload && (
+          <div style={styles.section}>
+            <div style={styles.sectionTitle}>Last Progress Event</div>
+            <pre style={styles.progressPayload}>
+              {JSON.stringify(diagnostics.lastProgressPayload, (key, value) => {
+                if (key === 'raw') return '[object]';
+                return value;
+              }, 2).substring(0, 500)}
+            </pre>
+          </div>
+        )}
+
         {/* Storage */}
         <div style={styles.section}>
           <div style={styles.sectionTitle}>Storage</div>
@@ -163,10 +238,13 @@ export function DebugPanel({ colors }: DebugPanelProps) {
             </div>
             <div style={styles.infoItem}>
               <span style={{ ...styles.infoLabel, color: colors.muted }}>After</span>
-              <span style={{ ...styles.infoValue, color: colors.primaryText }}>
+              <span style={{ 
+                ...styles.infoValue, 
+                color: diagnostics.storageAfter ? colors.primaryText : '#F57C00' 
+              }}>
                 {diagnostics.storageAfter 
                   ? `${formatBytes(diagnostics.storageAfter.usage)} / ${formatBytes(diagnostics.storageAfter.quota)}`
-                  : 'N/A'}
+                  : 'Not available (load incomplete)'}
               </span>
             </div>
           </div>
@@ -215,7 +293,7 @@ export function DebugPanel({ colors }: DebugPanelProps) {
               color: '#C62828',
               marginBottom: '8px'
             }}>
-              Error
+              Error / Timeout
             </div>
             <pre style={{ 
               margin: 0, 
@@ -282,7 +360,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   content: {
     padding: '16px',
-    maxHeight: '500px',
+    maxHeight: '600px',
     overflowY: 'auto',
   },
   section: {
@@ -294,6 +372,13 @@ const styles: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase',
     letterSpacing: '0.5px',
     marginBottom: '8px',
+  },
+  flagsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'auto auto',
+    gap: '4px 8px',
+    fontSize: '11px',
+    fontFamily: 'monospace',
   },
   progressBar: {
     height: '8px',
@@ -339,6 +424,24 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: '12px',
     fontFamily: 'monospace',
   },
+  lastEvent: {
+    marginTop: '8px',
+    fontSize: '10px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+  },
+  progressPayload: {
+    fontSize: '10px',
+    fontFamily: 'monospace',
+    background: '#F5F5F5',
+    padding: '8px',
+    borderRadius: '4px',
+    overflow: 'auto',
+    maxHeight: '100px',
+    whiteSpace: 'pre-wrap',
+    margin: 0,
+  },
   logContainer: {
     fontSize: '11px',
     fontFamily: 'monospace',
@@ -370,7 +473,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '12px',
     borderRadius: '8px',
     overflow: 'auto',
-    maxHeight: '200px',
+    maxHeight: '250px',
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-all',
     margin: 0,
