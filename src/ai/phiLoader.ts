@@ -1,6 +1,6 @@
 import { AutoTokenizer, AutoModelForCausalLM, env } from '@huggingface/transformers';
 
-// Simple WebGPU check - use any to avoid TypeScript DOM.WebGPU issues
+// Simple WebGPU check
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function hasWebGPU(): boolean {
   const gpu = (navigator as any).gpu;
@@ -18,37 +18,34 @@ export type LoadingStage =
 
 export type LoadingSubstage = 
   | 'idle'
-  | 'checking-navigator'
-  | 'requesting-adapter'
+  | 'checking-webgpu'
   | 'downloading-tokenizer'
-  | 'tokenizer-loaded'
-  | 'fetching-model-metadata'
+  | 'tokenizer-ready'
   | 'downloading-model-files'
-  | 'reading-cache'
   | 'finalizing-download'
   | 'parsing-onnx'
   | 'creating-session'
-  | 'initializing-webgpu'
-  | 'model-loaded'
+  | 'allocating-webgpu'
   | 'ready'
   | 'timeout'
-  | 'error'
-  | 'abandoned';
+  | 'error';
 
 export interface StorageInfo {
   usage: number;
   quota: number;
 }
 
-export interface ProgressEvent {
-  stage: string;
+export interface ProgressPayload {
+  // Raw fields from library
   name?: string;
   status?: string;
+  progress?: number;
   loaded?: number;
   total?: number;
-  progress?: number;
+  index?: number;
+  numThreads?: number;
+  // Our metadata
   timestamp: number;
-  raw: unknown;
 }
 
 export interface StageEntry {
@@ -57,6 +54,27 @@ export interface StageEntry {
   enteredAt: number;
   exitedAt?: number;
   durationMs?: number;
+}
+
+export interface CrashSnapshot {
+  // When snapshot was saved
+  savedAt: number;
+  // What was happening
+  stage: LoadingStage;
+  substage: LoadingSubstage;
+  elapsedMs: number;
+  // Raw progress history
+  progressHistory: ProgressPayload[];
+  // Last known progress
+  lastPayload: ProgressPayload | null;
+  // Size tracking
+  observedBytes: number;
+  observedTotal: number;
+  totalsConsistent: boolean;
+  // Error info
+  error: string | null;
+  // Whether we crashed
+  isCrash: boolean;
 }
 
 export interface LoaderDiagnostics {
@@ -69,22 +87,15 @@ export interface LoaderDiagnostics {
   loadGeneration: number;
   timedOut: boolean;
   abandonedLoad: boolean;
-  completedAfterTimeout: boolean;
   
-  // Progress tracking
-  tokenizerDownloadProgress: number;
-  modelDownloadProgress: number;
-  combinedProgress: number;
-  lastProgressPayload: ProgressEvent | null;
-  lastProgressTimestamp: number | null;
+  // Progress tracking - raw payloads
+  progressHistory: ProgressPayload[];
+  lastProgressPayload: ProgressPayload | null;
   
-  // Size estimation - both declared and observed
-  declaredModelSizeMB: number;
+  // Size tracking - honest accounting
   observedTransferBytes: number;
-  observedTransferMB: number;
   observedTotalBytes: number;
-  observedTotalMB: number;
-  estimatedTokenizerSizeMB: number | null;
+  totalsConsistent: boolean;
   
   // Storage
   storageBefore: StorageInfo | null;
@@ -93,22 +104,14 @@ export interface LoaderDiagnostics {
   // Timing
   startedAt: number | null;
   elapsedMs: number;
-  lastHeartbeatAt: number | null;
   lastProgressAt: number | null;
-  
-  // Model phase tracking
-  modelPhaseStartedAt: number | null;
-  modelPhaseHasProgress: boolean;
-  modelPhaseLastEvent: string | null;
-  modelPhaseStuckAtHighProgress: boolean;
-  
-  // Risk diagnostics
-  crashRiskLevel: 'none' | 'low' | 'medium' | 'high' | 'critical';
-  crashRiskMessage: string;
   
   // Stage tracking
   stageLog: StageEntry[];
   currentStageEntry: StageEntry | null;
+  
+  // Crash snapshot (from localStorage)
+  lastCrashSnapshot: CrashSnapshot | null;
   
   // Generate tracking
   generateReached: boolean;
@@ -125,12 +128,10 @@ const TIMEOUT_MS = 180000; // 3 minutes timeout
 const STALL_THRESHOLD_MS = 60000; // 1 minute without progress = stalled
 
 // Safe thresholds for mobile browsers
-const MOBILE_CRASH_RISK_THRESHOLD_MB = 500; // ~500MB transfer is high risk
-const MOBILE_CRITICAL_RISK_THRESHOLD_MB = 1024; // >1GB is critical risk
+const MOBILE_RISK_THRESHOLD_BYTES = 500 * 1024 * 1024; // 500MB
 
-// Declared/expected size (this is wrong - actual transfer is ~2GB)
-const DECLARED_MODEL_SIZE_MB = 385;
-const ESTIMATED_TOKENIZER_SIZE_MB = 0.05;
+// localStorage keys
+const CRASH_SNAPSHOT_KEY = 'ajawai_crash_snapshot';
 
 let tokenizer: Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>> | null = null;
 let model: Awaited<ReturnType<typeof AutoModelForCausalLM.from_pretrained>> | null = null;
@@ -141,14 +142,14 @@ let currentLoadGeneration = 0;
 // Track if current load has been abandoned
 let isCurrentLoadAbandoned = false;
 
-// Track finalization phase
-let isInFinalizationPhase = false;
-
 let state: LoaderDiagnostics = createInitialState();
 let loadingPromise: Promise<void> | null = null;
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let stalledCheckInterval: ReturnType<typeof setInterval> | null = null;
 const listeners: Set<StateListener> = new Set();
+
+// Progress history for crash analysis
+const progressHistory: ProgressPayload[] = [];
 
 function createInitialState(): LoaderDiagnostics {
   return {
@@ -158,55 +159,83 @@ function createInitialState(): LoaderDiagnostics {
     loadGeneration: 0,
     timedOut: false,
     abandonedLoad: false,
-    completedAfterTimeout: false,
-    tokenizerDownloadProgress: 0,
-    modelDownloadProgress: 0,
-    combinedProgress: 0,
+    progressHistory: [],
     lastProgressPayload: null,
-    lastProgressTimestamp: null,
-    declaredModelSizeMB: DECLARED_MODEL_SIZE_MB,
     observedTransferBytes: 0,
-    observedTransferMB: 0,
     observedTotalBytes: 0,
-    observedTotalMB: 0,
-    estimatedTokenizerSizeMB: ESTIMATED_TOKENIZER_SIZE_MB,
+    totalsConsistent: true,
     storageBefore: null,
     storageAfter: null,
     startedAt: null,
     elapsedMs: 0,
-    lastHeartbeatAt: null,
     lastProgressAt: null,
-    modelPhaseStartedAt: null,
-    modelPhaseHasProgress: false,
-    modelPhaseLastEvent: null,
-    modelPhaseStuckAtHighProgress: false,
-    crashRiskLevel: 'none',
-    crashRiskMessage: '',
     stageLog: [],
     currentStageEntry: null,
+    lastCrashSnapshot: loadCrashSnapshot(),
     generateReached: false,
     bugReport: '',
   };
 }
 
-function calculateCrashRisk(observedMB: number): { level: LoaderDiagnostics['crashRiskLevel']; message: string } {
-  if (observedMB >= MOBILE_CRITICAL_RISK_THRESHOLD_MB) {
-    return {
-      level: 'critical',
-      message: `CRITICAL: Observed ${observedMB.toFixed(0)}MB transfer exceeds safe browser budget (>1GB). High risk of crash during ONNX/WebGPU initialization.`,
-    };
-  } else if (observedMB >= MOBILE_CRASH_RISK_THRESHOLD_MB) {
-    return {
-      level: 'high',
-      message: `HIGH RISK: Observed ${observedMB.toFixed(0)}MB transfer exceeds 500MB. Browser crash likely during finalization phase.`,
-    };
-  } else if (observedMB >= 200) {
-    return {
-      level: 'medium',
-      message: `MEDIUM RISK: Observed ${observedMB.toFixed(0)}MB. Monitor for stability issues.`,
-    };
+// Persist crash snapshot to localStorage
+function saveCrashSnapshot(snapshot: CrashSnapshot): void {
+  try {
+    localStorage.setItem(CRASH_SNAPSHOT_KEY, JSON.stringify(snapshot));
+    console.log('[phiLoader] Crash snapshot saved to localStorage');
+  } catch (e) {
+    console.warn('[phiLoader] Failed to save crash snapshot:', e);
   }
-  return { level: 'none', message: '' };
+}
+
+// Load crash snapshot from localStorage
+function loadCrashSnapshot(): CrashSnapshot | null {
+  try {
+    const saved = localStorage.getItem(CRASH_SNAPSHOT_KEY);
+    if (saved) {
+      const snapshot = JSON.parse(saved) as CrashSnapshot;
+      console.log('[phiLoader] Loaded crash snapshot from localStorage');
+      return snapshot;
+    }
+  } catch (e) {
+    console.warn('[phiLoader] Failed to load crash snapshot:', e);
+  }
+  return null;
+}
+
+// Clear crash snapshot (call after successful load)
+function clearCrashSnapshot(): void {
+  try {
+    localStorage.removeItem(CRASH_SNAPSHOT_KEY);
+    console.log('[phiLoader] Crash snapshot cleared');
+  } catch (e) {
+    console.warn('[phiLoader] Failed to clear crash snapshot:', e);
+  }
+}
+
+// Save incremental progress snapshot
+function saveProgressSnapshot(payload: ProgressPayload, stage: LoadingStage, substage: LoadingSubstage, error: string | null = null): void {
+  // Collect unique totals seen
+  const totals = new Set<number>();
+  progressHistory.forEach(p => {
+    if (p.total) totals.add(p.total);
+  });
+  if (payload.total) totals.add(payload.total);
+  
+  const snapshot: CrashSnapshot = {
+    savedAt: Date.now(),
+    stage,
+    substage,
+    elapsedMs: state.startedAt ? Date.now() - state.startedAt : 0,
+    progressHistory: [...progressHistory].slice(-20), // Keep last 20
+    lastPayload: payload,
+    observedBytes: payload.loaded || 0,
+    observedTotal: payload.total || 0,
+    totalsConsistent: totals.size <= 1, // Consistent if only one total seen
+    error,
+    isCrash: true,
+  };
+  
+  saveCrashSnapshot(snapshot);
 }
 
 function notifyListeners(): void {
@@ -214,100 +243,61 @@ function notifyListeners(): void {
   listeners.forEach(listener => listener(snapshot));
 }
 
-function updateProgress(event: ProgressEvent): void {
-  // Extract values from event
-  const status = event.status || '';
-  const name = event.name || '';
-  const loaded = event.loaded || 0;
-  const total = event.total || 0;
-  const progress = event.progress || 0;
-  
-  // Update observed transfer size
-  if (total > 0) {
-    state.observedTotalBytes = total;
-    state.observedTotalMB = total / (1024 * 1024);
-    state.observedTransferMB = state.observedTotalMB;
-  }
-  if (loaded > 0) {
-    state.observedTransferBytes = loaded;
+function updateProgress(payload: ProgressPayload): void {
+  // Store raw progress in history
+  progressHistory.push(payload);
+  if (progressHistory.length > 50) {
+    progressHistory.shift();
   }
   
-  // Update crash risk based on observed size
-  const risk = calculateCrashRisk(state.observedTransferMB);
-  state.crashRiskLevel = risk.level;
-  state.crashRiskMessage = risk.message;
+  state.lastProgressPayload = payload;
+  state.lastProgressAt = Date.now();
   
-  // Determine substage based on progress and event details
+  // Track observed bytes honestly
+  if (payload.loaded !== undefined) {
+    state.observedTransferBytes = payload.loaded;
+  }
+  if (payload.total !== undefined) {
+    // Check if totals are consistent
+    if (state.observedTotalBytes > 0 && payload.total !== state.observedTotalBytes) {
+      state.totalsConsistent = false;
+    }
+    state.observedTotalBytes = payload.total;
+  }
+  
+  // Determine substage based on progress and payload
   let newSubstage: LoadingSubstage = state.substage;
+  const progress = payload.progress || 0;
+  const status = payload.status || '';
+  const name = payload.name || '';
   
-  // If progress is very high (>95%) and still not ready, we're in finalization
-  if (progress >= 0.95 && state.stage === 'loading-model' && state.substage !== 'model-loaded' && state.substage !== 'ready') {
-    isInFinalizationPhase = true;
-    newSubstage = 'finalizing-download';
-  }
-  
-  // Infer substage from event details
-  if (status === 'init' || name.includes('manifest')) {
-    newSubstage = 'fetching-model-metadata';
-  } else if (status === 'downloading' || status === 'progress') {
-    if (isInFinalizationPhase || progress >= 0.95) {
-      newSubstage = 'finalizing-download';
-    } else {
+  if (state.stage === 'loading-model') {
+    // At high progress (>=95%), we're in finalization
+    if (progress >= 0.95) {
+      // Try to infer exact finalization stage from payload
+      if (name.includes('onnx') || status === 'init') {
+        newSubstage = 'parsing-onnx';
+      } else if (name.includes('session')) {
+        newSubstage = 'creating-session';
+      } else if (name.includes('webgpu') || name.includes('gpu')) {
+        newSubstage = 'allocating-webgpu';
+      } else {
+        newSubstage = 'finalizing-download';
+      }
+    } else if (progress > 0) {
       newSubstage = 'downloading-model-files';
     }
-  } else if (status === 'ready' && name.includes('cache')) {
-    newSubstage = 'reading-cache';
-  } else if (name.includes('onnx') || name.includes('session')) {
-    newSubstage = 'creating-session';
-  } else if (status === 'init' && (name.includes('webgpu') || name.includes('gpu'))) {
-    newSubstage = 'initializing-webgpu';
-  }
-  
-  // Check if stuck at high progress (potential crash indicator)
-  if (progress >= 0.95 && state.stage === 'loading-model' && !isInFinalizationPhase) {
-    state.modelPhaseStuckAtHighProgress = true;
   }
   
   if (newSubstage !== state.substage) {
     enterStage(state.stage, newSubstage);
   }
   
-  // Update percentages
-  if (progress !== undefined) {
-    if (state.stage === 'loading-tokenizer') {
-      state.tokenizerDownloadProgress = Math.round(progress * 100);
-    } else if (state.stage === 'loading-model') {
-      state.modelDownloadProgress = Math.round(progress * 100);
-    }
-  }
-  
-  // Combined progress: tokenizer ~1%, model ~99%
-  const combined = (state.tokenizerDownloadProgress * 0.01) + (state.modelDownloadProgress * 0.99);
-  state.combinedProgress = Math.min(100, Math.round(combined));
-  
-  // Track model phase progress
-  if (state.stage === 'loading-model') {
-    state.modelPhaseHasProgress = true;
-    state.modelPhaseLastEvent = JSON.stringify({
-      name: event.name,
-      status: event.status,
-      loaded: event.loaded,
-      total: event.total,
-      progress: event.progress,
-    });
-  }
-  
-  // Store full progress payload
-  state.lastProgressPayload = event;
-  state.lastProgressTimestamp = event.timestamp;
-  state.lastProgressAt = Date.now();
+  // Save progress snapshot for crash recovery
+  saveProgressSnapshot(payload, state.stage, state.substage);
   
   // Log important events
-  if (progress >= 0.95) {
-    console.log(`[phiLoader] HIGH PROGRESS: ${(progress * 100).toFixed(2)}% - ${state.observedTransferMB.toFixed(0)}MB observed - Risk: ${state.crashRiskLevel}`);
-  } else {
-    console.log(`[phiLoader] Progress: ${(progress * 100).toFixed(2)}% - ${state.observedTransferMB.toFixed(0)}MB`);
-  }
+  console.log(`[phiLoader] ${state.stage}/${state.substage}: ${(progress * 100).toFixed(1)}% - loaded: ${payload.loaded || '?'} - total: ${payload.total || '?'}`);
   
   notifyListeners();
 }
@@ -331,17 +321,17 @@ function enterStage(stage: LoadingStage, substage: LoadingSubstage): void {
     enteredAt: now,
   };
   
-  // Track model phase start
-  if (stage === 'loading-model' && !state.modelPhaseStartedAt) {
-    state.modelPhaseStartedAt = now;
-  }
-  
   // Update elapsed time
   if (state.startedAt) {
     state.elapsedMs = now - state.startedAt;
   }
   
-  console.log(`[phiLoader] Stage: ${stage} → Substage: ${substage}`);
+  // Save snapshot on stage transition
+  if (state.lastProgressPayload) {
+    saveProgressSnapshot(state.lastProgressPayload, stage, substage);
+  }
+  
+  console.log(`[phiLoader] Stage: ${stage} → ${substage}`);
   notifyListeners();
 }
 
@@ -349,24 +339,29 @@ function setTimeoutState(): void {
   state.timedOut = true;
   state.stage = 'timeout';
   state.substage = 'timeout';
-  state.error = `Loading timed out after ${TIMEOUT_MS}ms. NOTE: Underlying model load may still be running in background.`;
+  state.error = `Loading timed out after ${TIMEOUT_MS}ms. Underlying model load may still be running.`;
   state.loadGeneration = currentLoadGeneration;
   
-  // Generate bug report at timeout
-  generateBugReport('timeout');
+  // Save timeout snapshot
+  saveProgressSnapshot(
+    { timestamp: Date.now() },
+    'timeout',
+    'timeout',
+    state.error
+  );
   
+  generateBugReport();
   console.error(`[phiLoader] TIMEOUT: ${state.elapsedMs}ms`);
   notifyListeners();
 }
 
 function setAbandoned(): void {
   state.abandonedLoad = true;
-  state.substage = 'abandoned';
-  state.error = `Load marked as abandoned. Underlying model load may still be running.`;
+  state.substage = 'error';
+  state.error = 'Load abandoned due to timeout';
   
-  generateBugReport('abandoned');
-  
-  console.warn('[phiLoader] Load marked as abandoned');
+  generateBugReport();
+  console.warn('[phiLoader] Load abandoned');
   notifyListeners();
 }
 
@@ -374,109 +369,113 @@ function setError(errorMsg: string): void {
   state.stage = 'error';
   state.substage = 'error';
   state.error = errorMsg;
-  state.lastProgressTimestamp = Date.now();
   
-  generateBugReport('error');
+  // Save error snapshot
+  saveProgressSnapshot(
+    { timestamp: Date.now() },
+    'error',
+    'error',
+    errorMsg
+  );
   
+  generateBugReport();
   notifyListeners();
 }
 
-function generateBugReport(trigger: 'timeout' | 'abandoned' | 'error' | 'high-risk' | 'final'): void {
+function generateBugReport(): void {
+  // Check for inconsistent totals
+  const totals = new Set<number>();
+  progressHistory.forEach(p => {
+    if (p.total) totals.add(p.total);
+  });
+  const totalsList = Array.from(totals);
+  
   const lines: string[] = [
-    '=== AJAWAI 2.2 Crash/Risk Diagnostics Bug Report ===',
+    '=== AJAWAI 2.2 Diagnostics Report ===',
     `Generated: ${new Date().toISOString()}`,
-    `Trigger: ${trigger}`,
-    `Load Generation: ${state.loadGeneration}`,
-    '',
-    '--- CRASH ANALYSIS ---',
-    `Observed Transfer: ${state.observedTransferMB.toFixed(2)} MB (${state.observedTransferBytes} bytes)`,
-    `Observed Total: ${state.observedTotalMB.toFixed(2)} MB (${state.observedTotalBytes} bytes)`,
-    `Declared Model Size: ${state.declaredModelSizeMB} MB`,
-    `Crash Risk Level: ${state.crashRiskLevel.toUpperCase()}`,
-    state.crashRiskMessage ? `Risk Message: ${state.crashRiskMessage}` : '',
     '',
     '--- Configuration ---',
     `Model ID: ${MODEL_ID}`,
-    `Package: @huggingface/transformers`,
     `Timeout: ${TIMEOUT_MS}ms`,
-    `Stall Threshold: ${STALL_THRESHOLD_MS}ms`,
-    `Mobile Crash Risk Threshold: ${MOBILE_CRASH_RISK_THRESHOLD_MB}MB`,
-    `Mobile Critical Threshold: ${MOBILE_CRITICAL_RISK_THRESHOLD_MB}MB`,
     '',
     '--- Environment ---',
     `WebGPU Available: ${hasWebGPU()}`,
     `User Agent: ${navigator.userAgent.substring(0, 80)}...`,
     '',
-    '--- State Flags ---',
+    '--- Current State ---',
     `Stage: ${state.stage}`,
     `Substage: ${state.substage}`,
+    `Load Generation: ${state.loadGeneration}`,
     `Timed Out: ${state.timedOut}`,
     `Abandoned: ${state.abandonedLoad}`,
-    `Completed After Timeout: ${state.completedAfterTimeout}`,
-    `Generate Reached: ${state.generateReached}`,
     `Elapsed: ${state.elapsedMs}ms`,
     '',
-    '--- Model Phase ---',
-    `Started At: ${state.modelPhaseStartedAt || 'N/A'}`,
-    `Has Progress: ${state.modelPhaseHasProgress}`,
-    `Stuck at High Progress: ${state.modelPhaseStuckAtHighProgress}`,
-    `Last Event: ${state.modelPhaseLastEvent || 'None'}`,
+    '--- Honest Size Accounting ---',
+    `Observed Transfer Bytes: ${state.observedTransferBytes} (${(state.observedTransferBytes / (1024*1024)).toFixed(1)} MB)`,
+    `Observed Total Bytes: ${state.observedTotalBytes} (${(state.observedTotalBytes / (1024*1024)).toFixed(1)} MB)`,
+    `Totals Consistent: ${state.totalsConsistent}`,
+    totalsList.length > 1 
+      ? `WARNING: Multiple totals seen: ${totalsList.map(t => (t/(1024*1024)).toFixed(1) + 'MB').join(', ')}`
+      : `Total: ${totalsList[0] ? (totalsList[0]/(1024*1024)).toFixed(1) + 'MB' : 'Unknown'}`,
     '',
-    '--- Progress ---',
-    `Tokenizer: ${state.tokenizerDownloadProgress}%`,
-    `Model: ${state.modelDownloadProgress}%`,
-    `Combined: ${state.combinedProgress}%`,
-    `Last Progress At: ${state.lastProgressTimestamp ? new Date(state.lastProgressTimestamp).toISOString() : 'N/A'}`,
-    '',
-    '--- Last Progress Payload ---',
-    state.lastProgressPayload 
-      ? JSON.stringify(state.lastProgressPayload, (key, value) => {
-          if (key === 'raw') return '[object]';
-          return value;
-        }, 2).substring(0, 800)
-      : 'None',
-    '',
-    '--- Storage ---',
-    `Storage Before: ${formatBytes(state.storageBefore?.usage || 0)} / ${formatBytes(state.storageBefore?.quota || 0)}`,
-    state.storageAfter 
-      ? `Storage After: ${formatBytes(state.storageAfter.usage)} / ${formatBytes(state.storageAfter.quota)}`
-      : 'Storage After: NOT AVAILABLE (browser may have crashed)',
-    '',
-    '--- Root Cause Analysis ---',
-    state.observedTotalMB > MOBILE_CRITICAL_RISK_THRESHOLD_MB 
-      ? 'ROOT CAUSE: Transfer size (~2GB) EXCEEDS mobile browser safe limits. Browser crashes during ONNX session creation / WebGPU initialization, not during download.'
-      : state.observedTotalMB > MOBILE_CRASH_RISK_THRESHOLD_MB
-        ? 'ROOT CAUSE: Transfer size exceeds recommended mobile limits. Browser may crash during finalization.'
-        : 'ROOT CAUSE: Unknown - check other diagnostics',
-    '',
-    '--- Stage Log ---',
+    '--- Progress History (last 10) ---',
   ];
   
-  // Add stage durations
-  for (let i = 0; i < state.stageLog.length; i++) {
-    const entry = state.stageLog[i];
-    lines.push(`${i + 1}. ${entry.stage} → ${entry.substage}: ${entry.durationMs || 0}ms`);
+  // Add last 10 progress events
+  const recentHistory = progressHistory.slice(-10);
+  recentHistory.forEach((p, i) => {
+    lines.push(`${i + 1}. progress:${p.progress?.toFixed(3)} loaded:${p.loaded} total:${p.total} status:${p.status || 'n/a'}`);
+  });
+  
+  lines.push('');
+  lines.push('--- Last Progress Payload ---');
+  if (state.lastProgressPayload) {
+    lines.push(JSON.stringify(state.lastProgressPayload, null, 2));
+  } else {
+    lines.push('None');
   }
   
-  if (state.currentStageEntry) {
-    const current = state.currentStageEntry;
-    lines.push(`${state.stageLog.length + 1}. ${current.stage} → ${current.substage}: (current, ${Date.now() - current.enteredAt}ms)`);
+  lines.push('');
+  lines.push('--- Storage ---');
+  if (state.storageBefore) {
+    lines.push(`Before: ${formatBytes(state.storageBefore.usage)} / ${formatBytes(state.storageBefore.quota)}`);
   }
+  if (state.storageAfter) {
+    lines.push(`After: ${formatBytes(state.storageAfter.usage)} / ${formatBytes(state.storageAfter.quota)}`);
+  } else {
+    lines.push('After: NOT AVAILABLE (browser may have crashed)');
+  }
+  
+  lines.push('');
+  lines.push('--- Stage Log ---');
+  state.stageLog.forEach((entry, i) => {
+    lines.push(`${i + 1}. ${entry.stage} → ${entry.substage}: ${entry.durationMs || 0}ms`);
+  });
   
   lines.push('');
   lines.push('--- Error ---');
   lines.push(state.error || 'None');
   
+  // Add crash risk warning
+  if (state.observedTotalBytes > MOBILE_RISK_THRESHOLD_BYTES) {
+    lines.push('');
+    lines.push('--- CRASH RISK WARNING ---');
+    lines.push(`Observed transfer (${(state.observedTotalBytes/(1024*1024)).toFixed(0)}MB) exceeds mobile-safe threshold (500MB)`);
+    lines.push('Browser crash likely during finalization/ONNX/WebGPU initialization');
+  }
+  
   lines.push('');
-  lines.push('=== End Bug Report ===');
+  lines.push('=== End Report ===');
   
   state.bugReport = lines.join('\n');
   
-  // Also log critical info to console for crash recovery
-  if (state.crashRiskLevel === 'critical') {
-    console.error('[phiLoader] CRITICAL CRASH RISK:', state.crashRiskMessage);
-    console.error('[phiLoader] Transfer size:', state.observedTransferMB.toFixed(0), 'MB vs declared:', state.declaredModelSizeMB, 'MB');
-  }
+  // Save final snapshot
+  saveProgressSnapshot(
+    state.lastProgressPayload || { timestamp: Date.now() },
+    state.stage,
+    state.substage,
+    state.error
+  );
 }
 
 function formatBytes(bytes: number): string {
@@ -500,28 +499,11 @@ async function getStorageEstimate(): Promise<StorageInfo> {
 }
 
 function startHeartbeat(): void {
-  state.lastHeartbeatAt = Date.now();
-  
   // Heartbeat every second
   heartbeatInterval = setInterval(() => {
-    state.lastHeartbeatAt = Date.now();
     if (state.startedAt) {
       state.elapsedMs = Date.now() - state.startedAt;
     }
-    
-    // Check if we're stuck at high progress without moving to finalization
-    if (state.modelPhaseStuckAtHighProgress && state.stage === 'loading-model') {
-      const timeSinceProgress = Date.now() - (state.lastProgressAt || 0);
-      if (timeSinceProgress > 30000 && state.modelDownloadProgress >= 95) {
-        // Been stuck at >95% for 30 seconds - likely about to crash
-        state.crashRiskLevel = 'critical';
-        state.crashRiskMessage = 'STUCK AT 99%+ FOR 30s - Browser likely about to crash during finalization';
-        generateBugReport('high-risk');
-        notifyListeners();
-      }
-    }
-    
-    // Skip notifying if load was abandoned
     if (!isCurrentLoadAbandoned) {
       notifyListeners();
     }
@@ -533,17 +515,16 @@ function startStalledCheck(): void {
     const now = Date.now();
     const lastProgress = state.lastProgressAt || state.startedAt;
     
-    // Skip if this load was abandoned
     if (isCurrentLoadAbandoned) {
       return;
     }
     
+    // Check for stall
     if (lastProgress && state.stage !== 'ready' && state.stage !== 'error' && state.stage !== 'timeout') {
       const timeSinceProgress = now - lastProgress;
-      
       if (timeSinceProgress > STALL_THRESHOLD_MS) {
         console.warn(`[phiLoader] STALLED: No progress for ${timeSinceProgress}ms`);
-        generateBugReport('high-risk');
+        generateBugReport();
         notifyListeners();
       }
     }
@@ -553,7 +534,6 @@ function startStalledCheck(): void {
       const elapsed = now - state.startedAt;
       if (elapsed > TIMEOUT_MS) {
         setTimeoutState();
-        // Mark as abandoned so late completions are ignored
         setAbandoned();
         isCurrentLoadAbandoned = true;
       }
@@ -573,28 +553,31 @@ function stopTimers(): void {
 }
 
 export function getStatus(): LoaderDiagnostics {
-  return { ...state, stageLog: [...state.stageLog] };
+  return { 
+    ...state, 
+    progressHistory: [...progressHistory],
+    stageLog: [...state.stageLog] 
+  };
 }
 
 export function subscribe(listener: StateListener): () => void {
   listeners.add(listener);
-  // Immediately call with current state
   listener(getStatus());
-  // Return unsubscribe function
   return () => listeners.delete(listener);
 }
 
 export async function loadPhi(): Promise<void> {
-  // Increment load generation to track this specific load
+  // Increment load generation
   currentLoadGeneration++;
   const thisLoadGeneration = currentLoadGeneration;
   isCurrentLoadAbandoned = false;
-  isInFinalizationPhase = false;
+  
+  // Clear progress history for new load
+  progressHistory.length = 0;
   
   console.log(`[phiLoader] Starting load generation ${thisLoadGeneration}`);
-  console.log(`[phiLoader] NOTE: Declared model size is ${DECLARED_MODEL_SIZE_MB}MB but actual transfer may be ~2GB`);
   
-  // Single-flight: block duplicates
+  // Single-flight: block duplicates for same generation
   if (loadingPromise && currentLoadGeneration === thisLoadGeneration) {
     return loadingPromise;
   }
@@ -613,8 +596,6 @@ export async function loadPhi(): Promise<void> {
     await loadingPromise;
   } finally {
     loadingPromise = null;
-    
-    // Only clean up timers if this is still the current load
     if (currentLoadGeneration === thisLoadGeneration) {
       stopTimers();
     }
@@ -626,17 +607,18 @@ async function _loadPhi(loadGeneration: number): Promise<void> {
   state = createInitialState();
   state.loadGeneration = loadGeneration;
   
+  // Clear crash snapshot on new load
+  clearCrashSnapshot();
+  
   // Start timers
   startHeartbeat();
   startStalledCheck();
   
   // Stage: checking-webgpu
-  enterStage('checking-webgpu', 'checking-navigator');
+  enterStage('checking-webgpu', 'checking-webgpu');
   
   console.log('[phiLoader] Starting Phi-3.5 loading...');
   console.log('[phiLoader] Model:', MODEL_ID);
-  console.log('[phiLoader] Package: @huggingface/transformers');
-  console.log('[phiLoader] Load Generation:', loadGeneration);
   
   // Check WebGPU availability
   if (!hasWebGPU()) {
@@ -644,16 +626,13 @@ async function _loadPhi(loadGeneration: number): Promise<void> {
     return;
   }
   
-  enterStage('checking-webgpu', 'requesting-adapter');
-  console.log('[phiLoader] WebGPU available');
-  
   // Configure Transformers.js for WebGPU
   env.useBrowserCache = true;
   env.allowLocalModels = false;
   
   // Get storage before loading
   state.storageBefore = await getStorageEstimate();
-  console.log('[phiLoader] Storage before:', formatBytes(state.storageBefore.usage), '/', formatBytes(state.storageBefore.quota));
+  console.log('[phiLoader] Storage before:', formatBytes(state.storageBefore.usage));
   notifyListeners();
 
   // Stage: loading-tokenizer
@@ -663,31 +642,25 @@ async function _loadPhi(loadGeneration: number): Promise<void> {
     tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       progress_callback: (progressInfo: any) => {
-        // Check if this load was abandoned
         if (isCurrentLoadAbandoned || currentLoadGeneration !== loadGeneration) {
-          console.log('[phiLoader] Ignoring tokenizer progress - load abandoned');
           return;
         }
         
         updateProgress({
-          stage: 'tokenizer',
           name: progressInfo.name,
           status: progressInfo.status,
+          progress: progressInfo.progress,
           loaded: progressInfo.loaded,
           total: progressInfo.total,
-          progress: progressInfo.progress,
           timestamp: Date.now(),
-          raw: progressInfo,
         });
       },
     });
-    state.tokenizerDownloadProgress = 100;
-    enterStage('loading-tokenizer', 'tokenizer-loaded');
+    enterStage('loading-tokenizer', 'tokenizer-ready');
     console.log('[phiLoader] Tokenizer loaded');
   } catch (err) {
-    // Check if timed out while loading tokenizer
     if (isCurrentLoadAbandoned) {
-      console.log('[phiLoader] Tokenizer load abandoned due to timeout');
+      console.log('[phiLoader] Tokenizer load abandoned');
       return;
     }
     setError(`Failed to load tokenizer: ${err}`);
@@ -695,7 +668,7 @@ async function _loadPhi(loadGeneration: number): Promise<void> {
   }
 
   // Stage: loading-model
-  enterStage('loading-model', 'fetching-model-metadata');
+  enterStage('loading-model', 'downloading-model-files');
   
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -704,55 +677,54 @@ async function _loadPhi(loadGeneration: number): Promise<void> {
       dtype: 'q4f16',
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       progress_callback: (progressInfo: any) => {
-        // Check if this load was abandoned
         if (isCurrentLoadAbandoned || currentLoadGeneration !== loadGeneration) {
-          console.log('[phiLoader] Ignoring model progress - load abandoned');
+          console.log('[phiLoader] Ignoring progress - load abandoned');
           return;
         }
         
         updateProgress({
-          stage: progressInfo.stage || 'model',
           name: progressInfo.name,
           status: progressInfo.status,
+          progress: progressInfo.progress,
           loaded: progressInfo.loaded,
           total: progressInfo.total,
-          progress: progressInfo.progress,
+          index: progressInfo.index,
+          numThreads: progressInfo.numThreads,
           timestamp: Date.now(),
-          raw: progressInfo,
         });
       },
     }) as any;
     
-    // Check if timed out while loading model
+    // Check if load was abandoned
     if (isCurrentLoadAbandoned || currentLoadGeneration !== loadGeneration) {
       console.log('[phiLoader] Model load completed but was abandoned');
-      state.completedAfterTimeout = true;
-      generateBugReport('abandoned');
       return;
     }
     
-    state.modelDownloadProgress = 100;
-    enterStage('loading-model', 'initializing-webgpu');
+    enterStage('loading-model', 'allocating-webgpu');
     console.log('[phiLoader] Model initialized on WebGPU');
   } catch (err) {
-    // Check if timed out while loading model
     if (isCurrentLoadAbandoned) {
-      console.log('[phiLoader] Model load abandoned due to timeout');
+      console.log('[phiLoader] Model load abandoned');
       return;
     }
     setError(`Failed to load model: ${err}`);
     return;
   }
   
-  enterStage('loading-model', 'model-loaded');
+  enterStage('loading-model', 'ready');
   
   // Get storage after loading
   state.storageAfter = await getStorageEstimate();
-  console.log('[phiLoader] Storage after:', formatBytes(state.storageAfter.usage), '/', formatBytes(state.storageAfter.quota));
+  console.log('[phiLoader] Storage after:', formatBytes(state.storageAfter.usage));
 
   // Stage: ready
   enterStage('ready', 'ready');
-  generateBugReport('final');
+  
+  // Clear crash snapshot on success
+  clearCrashSnapshot();
+  
+  generateBugReport();
   notifyListeners();
 }
 
@@ -767,7 +739,7 @@ export function getTokenizer() {
 export function markGenerateReached(): void {
   if (state) {
     state.generateReached = true;
-    generateBugReport('final');
+    generateBugReport();
     notifyListeners();
   }
 }
